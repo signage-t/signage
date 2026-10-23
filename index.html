@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<title>Signage</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; cursor: none; }
+  canvas { position: absolute; inset: 0; margin: auto; opacity: 0; transition: opacity .8s; }
+  canvas.show { opacity: 1; }
+  #msg { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+         color: #555; font: 16px sans-serif; text-align: center; padding: 16px; }
+  #dbg { position: absolute; left: 8px; bottom: 8px; display: none; color: #0f0;
+         background: rgba(0,0,0,.6); font: 12px monospace; padding: 4px 6px; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+</head>
+<body>
+<div id="msg">PDFを待っています…</div>
+<canvas id="c0"></canvas><canvas id="c1"></canvas>
+<div id="dbg"></div>
+<script>
+/* ===== 設定（URLの ? 以降で指定） =====
+   api   : Apps Script ウェブアプリのURL（…/exec）  ※必須
+   key   : Apps Script に設定した合言葉            ※必須
+   sec   : 1枚あたりの表示秒数（既定 10）
+   poll  : 更新確認の間隔・秒（既定 60）
+   debug : 付けると左下に同期状況を表示
+*/
+const WORKER_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+const q        = new URLSearchParams(location.search);
+const API      = q.get("api");
+const KEY      = q.get("key") || "";
+const INTERVAL = (Number(q.get("sec"))  || 10) * 1000;
+const POLL     = (Number(q.get("poll")) || 60) * 1000;
+const DEBUG    = q.has("debug");
+
+const canvases = [document.getElementById("c0"), document.getElementById("c1")];
+const msg = document.getElementById("msg");
+const dbg = document.getElementById("dbg");
+if (DEBUG) dbg.style.display = "block";
+const status = (t) => { if (DEBUG) dbg.textContent = new Date().toLocaleTimeString() + " " + t; };
+
+/* ---------- 端末内データベース（IndexedDB）---------- */
+const dbp = new Promise((res, rej) => {
+  try {
+    const r = indexedDB.open("signage", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("pdfs", { keyPath: "id" });
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  } catch (e) { rej(e); }
+});
+function idb(mode, fn) {
+  return dbp.then((d) => new Promise((res, rej) => {
+    const tx = d.transaction("pdfs", mode);
+    const req = fn(tx.objectStore("pdfs"));
+    tx.oncomplete = () => res(req && req.result);
+    tx.onerror = () => rej(tx.error);
+  }));
+}
+const idbAll = ()   => idb("readonly",  (s) => s.getAll());
+const idbGet = (id) => idb("readonly",  (s) => s.get(id));
+const idbPut = (v)  => idb("readwrite", (s) => s.put(v));
+const idbDel = (id) => idb("readwrite", (s) => s.delete(id));
+
+/* ---------- PDFの管理 ---------- */
+let entries = new Map();  // id -> {id, name, updated, doc}
+let slides = [];          // {e, page}  ※複数ページPDFは各ページが1枚
+let idx = 0, front = 0, shownKey = null, timer = null, busy = false;
+
+const openDoc = (buf) => pdfjsLib.getDocument({ data: new Uint8Array(buf.slice(0)) }).promise;
+
+function b64ToBuf(b64) {
+  const bin = atob(b64), u = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  return u.buffer;
+}
+
+function rebuild() {
+  const list = [...entries.values()]
+    .sort((a, b) => a.name.localeCompare(b.name, "ja", { numeric: true }));
+  slides = [];
+  for (const e of list)
+    for (let p = 1; p <= e.doc.numPages; p++) slides.push({ e, page: p });
+  msg.style.display = slides.length ? "none" : "flex";
+  if (!slides.length) { canvases.forEach((c) => c.classList.remove("show")); shownKey = null; }
+  else if (!shownKey) tick();
+}
+
+async function loadCache() {
+  try {
+    for (const r of await idbAll()) {
+      try { entries.set(r.id, { id: r.id, name: r.name, updated: r.updated, doc: await openDoc(r.buf) }); }
+      catch (e) { console.error(e); }
+    }
+  } catch (e) { console.error("IndexedDB unavailable", e); }
+  rebuild();
+}
+
+async function api(params) {
+  const u = new URL(API);
+  u.searchParams.set("key", KEY);
+  for (const k in params) u.searchParams.set(k, params[k]);
+  u.searchParams.set("_", Date.now());
+  const r = await fetch(u, { cache: "no-store" });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  const j = await r.json();
+  if (j.error) throw new Error(j.error);
+  return j;
+}
+
+let syncing = false;
+async function sync() {
+  if (syncing) return;
+  syncing = true;
+  try {
+    const { files } = await api({});
+    const ids = new Set(files.map((f) => f.id));
+
+    for (const f of files) {
+      const cur = entries.get(f.id);
+      if (cur && cur.updated === f.updated) {
+        if (cur.name !== f.name) {               // 名前だけ変わった（並び順の変更）
+          cur.name = f.name;
+          try { const r = await idbGet(f.id); if (r) { r.name = f.name; await idbPut(r); } } catch (_) {}
+        }
+        continue;
+      }
+      status("ダウンロード中: " + f.name);
+      const { data } = await api({ id: f.id });
+      const buf = b64ToBuf(data);
+      const doc = await openDoc(buf);
+      try { await idbPut({ id: f.id, name: f.name, updated: f.updated, buf }); } catch (_) {}
+      if (cur) cur.doc.destroy();
+      entries.set(f.id, { id: f.id, name: f.name, updated: f.updated, doc });
+    }
+
+    for (const [id, e] of entries) {
+      if (!ids.has(id)) {                         // フォルダから消えたPDF
+        e.doc.destroy();
+        entries.delete(id);
+        try { await idbDel(id); } catch (_) {}
+      }
+    }
+    status("同期OK（" + files.length + "件）");
+  } catch (e) {
+    status("同期失敗（保存済みのPDFで表示継続）: " + e.message);
+  } finally {
+    rebuild();
+    syncing = false;
+  }
+}
+
+/* ---------- 表示 ---------- */
+async function render(slide) {
+  const pg  = await slide.e.doc.getPage(slide.page);
+  const v1  = pg.getViewport({ scale: 1 });
+  const dpr = window.devicePixelRatio || 1;
+  const fit = Math.min(innerWidth / v1.width, innerHeight / v1.height);
+  const vp  = pg.getViewport({ scale: fit * dpr });
+  const c   = canvases[1 - front];
+  c.width = Math.floor(vp.width);  c.height = Math.floor(vp.height);
+  c.style.width = (vp.width / dpr) + "px";  c.style.height = (vp.height / dpr) + "px";
+  await pg.render({ canvasContext: c.getContext("2d"), viewport: vp }).promise;
+  c.classList.add("show");
+  canvases[front].classList.remove("show");
+  front = 1 - front;
+}
+
+async function tick(force = false) {
+  if (busy) return;
+  busy = true;
+  clearTimeout(timer);
+  try {
+    if (slides.length) {
+      if (idx >= slides.length) idx = 0;
+      const s = slides[idx];
+      const key = s.e.id + "#" + s.page + "@" + s.e.updated;
+      if (force || key !== shownKey) {
+        try { await render(s); shownKey = key; } catch (e) { console.error(e); }
+      }
+      idx++;
+    }
+  } finally {
+    busy = false;
+    timer = setTimeout(tick, INTERVAL);
+  }
+}
+
+let rt;
+addEventListener("resize", () => {
+  clearTimeout(rt);
+  rt = setTimeout(() => { idx = Math.max(0, idx - 1); tick(true); }, 300);
+});
+
+/* ---------- 全画面・スリープ防止・定期リロード ---------- */
+async function keepAwake() {
+  try { await navigator.wakeLock?.request("screen"); } catch (_) {}
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") keepAwake();
+});
+document.addEventListener("click", () => {
+  const el = document.documentElement;
+  (el.requestFullscreen || el.webkitRequestFullscreen)?.call(el);
+  keepAwake();
+});
+// 長時間つけっぱなしでも安定するよう、毎日 3:00 にページを読み直す（オフラインでも保存データで再開）
+(function scheduleReload() {
+  const t = new Date(); t.setHours(3, 0, 0, 0);
+  if (t <= new Date()) t.setDate(t.getDate() + 1);
+  setTimeout(() => location.reload(), t - new Date());
+})();
+
+/* ---------- 起動 ---------- */
+(async () => {
+  if (!window.pdfjsLib) {
+    msg.textContent = "読み込みに失敗しました。1分後に再試行します…";
+    setTimeout(() => location.reload(), 60000);
+    return;
+  }
+  if (!API) { msg.textContent = "URLに api= と key= を指定してください"; return; }
+
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+
+  try {
+    const t = await (await fetch(WORKER_URL)).text();
+    pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(new Blob([t], { type: "text/javascript" }));
+  } catch (_) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = WORKER_URL;
+  }
+
+  keepAwake();
+  await loadCache();      // まず端末に保存済みのPDFで表示開始
+  await sync();           // その後ドライブと同期
+  setInterval(sync, POLL);
+})();
+</script>
+</body>
+</html>
